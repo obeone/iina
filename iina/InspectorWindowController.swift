@@ -108,10 +108,6 @@ class InspectorWindowController: NSWindowController, NSWindowDelegate, NSTableVi
 
     deleteButton.isEnabled = false
 
-    if #available(macOS 10.14, *) {} else {
-      window?.appearance = NSAppearance(named: .vibrantDark)
-    }
-
     updateInfo()
     watchTableView.scrollRowToVisible(0)
   }
@@ -179,7 +175,6 @@ class InspectorWindowController: NSWindowController, NSWindowDelegate, NSTableVi
           MPVProperty.containerFps: self.vfpsField,
           MPVProperty.currentVo: self.voField,
           MPVProperty.currentTracksAudioCodecDesc: self.acodecField,
-          MPVProperty.currentAo: self.aoField,
           MPVProperty.audioParamsFormat: self.aformatField,
           MPVProperty.audioParamsChannels: self.achannelsField,
           MPVProperty.audioBitrate: self.abitrateField,
@@ -246,7 +241,8 @@ class InspectorWindowController: NSWindowController, NSWindowDelegate, NSTableVi
         MPVProperty.mistimedFrameCount: self.mistimedFramesField,
         MPVProperty.displayFps: self.displayFPSField,
         MPVProperty.estimatedVfFps: self.voFPSField,
-        MPVProperty.estimatedDisplayFps: self.edispFPSField
+        MPVProperty.estimatedDisplayFps: self.edispFPSField,
+        MPVProperty.currentAo: self.aoField,
       ]
 
       for (k, v) in dynamicStrProperties {
@@ -264,8 +260,19 @@ class InspectorWindowController: NSWindowController, NSWindowDelegate, NSTableVi
       let player = PlayerCore.lastActive
       if player.mainWindow.loaded && player.info.state.loaded {
         if let colorspace = player.mainWindow.videoView.videoLayer.colorspace {
-          let isHdr = colorspace != VideoView.SRGB
-          self.vcolorspaceField.stringValue = "\(colorspace.name!) (\(isHdr ? "H" : "S")DR)"
+          let screenColorSpace = player.mainWindow.window?.screen?.colorSpace
+          let sdrColorSpace = screenColorSpace?.cgColorSpace ?? VideoView.SRGB
+          let isHdr = colorspace != sdrColorSpace
+          // Prefer the name of the CGColorSpace of the layer. If the CGColorSpace does not have a
+          // name then if the layer is set to the color space of the screen then fall back to the
+          // localized name on the NSColorSpace, if present. Otherwise report it as unspecified.
+          let name: String = {
+            if let name = colorspace.name { return name as String }
+            if let screenColorSpace, colorspace == screenColorSpace.cgColorSpace,
+               let name = screenColorSpace.localizedName { return name }
+            return "Unspecified"
+          }()
+          self.vcolorspaceField.stringValue = "\(name) (\(isHdr ? "H" : "S")DR)"
         } else {
           self.vcolorspaceField.stringValue = "Unspecified (SDR)"
         }

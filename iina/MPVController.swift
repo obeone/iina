@@ -75,10 +75,6 @@ struct MPVHookValue {
 
 // Global functions
 
-protocol MPVEventDelegate {
-  func onMPVEvent(_ event: MPVEvent)
-}
-
 class MPVController: NSObject {
   struct UserData {
     static let screenshot: UInt64 = 1000000
@@ -101,7 +97,6 @@ class MPVController: NSObject {
 
   private var openGLContext: CGLContextObj! = nil
 
-  var mpvClientName: UnsafePointer<CChar>!
   var mpvVersion: String { getString(MPVProperty.mpvVersion)! }
 
   /// [DispatchQueue](https://developer.apple.com/documentation/dispatch/dispatchqueue) for reading `mpv`
@@ -236,7 +231,7 @@ class MPVController: NSObject {
     }
     // Only set the option if a change is needed to avoid logging when nothing has changed.
     if needsAdjustment {
-      setString(MPVOption.Video.hwdecCodecs, adjusted.joined(separator: ","))
+      chkErr(setOptionString(MPVOption.Video.hwdecCodecs, adjusted.joined(separator: ",")))
     }
   }
 
@@ -300,7 +295,7 @@ class MPVController: NSObject {
     }
     if needsWorkaround {
       log("Disabling hardware acceleration for VP9 encoded videos to workaround FFmpeg 9599")
-      setString(MPVOption.Video.hwdecCodecs, adjusted.joined(separator: ","))
+      chkErr(setOptionString(MPVOption.Video.hwdecCodecs, adjusted.joined(separator: ",")))
     }
   }
 
@@ -310,9 +305,6 @@ class MPVController: NSObject {
   func mpvInit() {
     // Create a new mpv instance and an associated client API handle to control the mpv instance.
     mpv = mpv_create()
-
-    // Get the name of this client handle.
-    mpvClientName = mpv_client_name(mpv)
 
     // User default settings
 
@@ -357,7 +349,13 @@ class MPVController: NSObject {
     setUserOption(PK.screenshotFormat, type: .other, forName: MPVOption.Screenshot.screenshotFormat,
                   level: .verbose) { key in
       let v = Preference.integer(for: key)
-      return Preference.ScreenshotFormat(rawValue: v)?.string
+      let format = Preference.ScreenshotFormat(rawValue: v)
+      // Workaround for mpv issue  #15107, HDR screenshots are unimplemented (gpu/gpu-next).
+      // If the screenshot format is set to JPEG XL then set the screenshot-sw option to yes. This
+      // causes the screenshot to be rendered by software instead of the VO. If a HDR video is being
+      // displayed in HDR then the resulting screenshot will be HDR.
+      self.chkErr(self.setOptionFlag(MPVOption.Screenshot.screenshotSw, format == .jxl))
+      return format?.string
     }
 
     setUserOption(PK.screenshotTemplate, type: .string, forName: MPVOption.Screenshot.screenshotTemplate,
@@ -408,7 +406,7 @@ class MPVController: NSObject {
     if Preference.bool(for: PK.spdifAC3) { spdif.append("ac3") }
     if Preference.bool(for: PK.spdifDTS){ spdif.append("dts") }
     if Preference.bool(for: PK.spdifDTSHD) { spdif.append("dts-hd") }
-    setString(MPVOption.Audio.audioSpdif, spdif.joined(separator: ","), level: .verbose)
+    chkErr(setOptionString(MPVOption.Audio.audioSpdif, spdif.joined(separator: ","), level: .verbose))
 
     setUserOption(PK.audioDevice, type: .string, forName: MPVOption.Audio.audioDevice, level: .verbose)
 
@@ -428,15 +426,13 @@ class MPVController: NSObject {
     player.info.subEncoding = Preference.string(for: .defaultEncoding)
 
     let subOverrideHandler: OptionObserverInfo.Transformer = { key in
-      let v = Preference.bool(for: .ignoreAssStyles)
-      let level: Preference.SubOverrideLevel = Preference.enum(for: .subOverrideLevel)
-      return v ? level.string : "yes"
+      (Preference.enum(for: key) as Preference.SubOverrideLevel).string
     }
-
-    setUserOption(PK.ignoreAssStyles, type: .other, forName: MPVOption.Subtitles.subAssOverride,
-                  level: .verbose, transformer: subOverrideHandler)
     setUserOption(PK.subOverrideLevel, type: .other, forName: MPVOption.Subtitles.subAssOverride,
                   level: .verbose, transformer: subOverrideHandler)
+    setUserOption(PK.secondarySubOverrideLevel, type: .other,
+                  forName: MPVOption.Subtitles.secondarySubAssOverride, level: .verbose,
+                  transformer: subOverrideHandler)
 
     setUserOption(PK.subTextFont, type: .string, forName: MPVOption.Subtitles.subFont, level: .verbose)
     setUserOption(PK.subTextSize, type: .float, forName: MPVOption.Subtitles.subFontSize, level: .verbose)
@@ -475,7 +471,7 @@ class MPVController: NSObject {
     setUserOption(PK.subMarginX, type: .int, forName: MPVOption.Subtitles.subMarginX, level: .verbose)
     setUserOption(PK.subMarginY, type: .int, forName: MPVOption.Subtitles.subMarginY, level: .verbose)
 
-    setUserOption(PK.subPos, type: .int, forName: MPVOption.Subtitles.subPos, level: .verbose)
+    setUserOption(PK.subPos, type: .float, forName: MPVOption.Subtitles.subPos, level: .verbose)
 
     setUserOption(PK.subLang, type: .string, forName: MPVOption.TrackSelection.slang, level: .verbose)
 
@@ -509,16 +505,22 @@ class MPVController: NSObject {
       return v.string
     }
 
-    setUserOption(PK.ytdlEnabled, type: .bool, forName: MPVOption.ProgramBehavior.ytdl, level: .verbose)
+    setUserOption(PK.ytdlEnabled, type: .other, forName: MPVOption.ProgramBehavior.ytdl, level: .verbose) { key in
+      let v = Preference.bool(for: .ytdlEnabled)
+      if JavascriptPlugin.hasYTDL {
+        return "no"
+      }
+      return v ? "yes" : "no"
+    }
     setUserOption(PK.ytdlRawOptions, type: .string, forName: MPVOption.ProgramBehavior.ytdlRawOptions,
                   level: .verbose)
     chkErr(setOptionString(MPVOption.ProgramBehavior.resetOnNextFile,
             "\(MPVOption.PlaybackControl.abLoopA),\(MPVOption.PlaybackControl.abLoopB)", level: .verbose))
 
-    // As mpv support for audio using the AVFoundation framework is new we enable it before applying
-    // user's settings. This allows a user to roll back to the Core Audio framework should a problem
-    // be encountered with the new code.
-    chkErr(setOptionString(MPVOption.Audio.ao, "avfoundation", level: .verbose))
+    setUserOption(PK.audioDriverEnableAVFoundation, type: .other, forName: MPVOption.Audio.ao,
+                  level: .verbose) { key in
+      Preference.bool(for: key) ? "avfoundation" : "coreaudio"
+    }
 
     // Set user defined conf dir.
     if Preference.bool(for: .enableAdvancedSettings),
@@ -528,7 +530,7 @@ class MPVController: NSObject {
       setOptionString("config", "yes", level: .verbose)
       let status = setOptionString(MPVOption.ProgramBehavior.configDir, userConfDir)
       if status < 0 {
-        Utility.showAlert("extra_option.config_folder", arguments: [userConfDir])
+        Utility.showAlert("extra_option.config_folder", arguments: [userConfDir], disableMenus: true)
       }
     }
 
@@ -541,13 +543,13 @@ class MPVController: NSObject {
             let status = setOptionString(op[0], op[1])
             if status < 0 {
               Utility.showAlert("extra_option.error", arguments:
-                                  [op[0], op[1], status])
+                                  [op[0], op[1], status], disableMenus: true)
             }
           }
           log("Set user configured mpv option values")
         }
       } else {
-        Utility.showAlert("extra_option.cannot_read")
+        Utility.showAlert("extra_option.cannot_read", disableMenus: true)
       }
     }
 
@@ -608,7 +610,7 @@ class MPVController: NSObject {
         needsUpdate = true
       }
       if needsUpdate {
-        setString(MPVOption.WatchLater.watchLaterOptions, watchLaterOptions, level: .verbose)
+        chkErr(setOptionString(MPVOption.WatchLater.watchLaterOptions, watchLaterOptions, level: .verbose))
       }
     }
     if let watchLaterOptions = getString(MPVOption.WatchLater.watchLaterOptions) {
@@ -622,9 +624,9 @@ class MPVController: NSObject {
 
     // Set options that can be override by user's config. mpv will log user config when initialize,
     // so we put them here.
-    chkErr(setString(MPVOption.Video.vo, "libmpv", level: .verbose))
-    chkErr(setString(MPVOption.Window.keepaspect, "no", level: .verbose))
-    chkErr(setString(MPVOption.Video.gpuHwdecInterop, "auto", level: .verbose))
+    chkErr(setOptionString(MPVOption.Video.vo, "libmpv", level: .verbose))
+    chkErr(setOptionString(MPVOption.Window.keepaspect, "no", level: .verbose))
+    chkErr(setOptionString(MPVOption.Video.gpuHwdecInterop, "auto", level: .verbose))
   }
 
   /// Initialize the `mpv` renderer.
@@ -721,10 +723,14 @@ class MPVController: NSObject {
 
   /// Shutdown this mpv controller.
   func mpvQuit() {
-    // Observers must be removed to avoid accessing the mpv core after it has shutdown.
-    removeObservers()
-    // Start mpv quitting. Even though this command is being sent using the synchronous command API
-    // the quit command is special and will be executed by mpv asynchronously.
+    // Remove observers for IINA preference. Must not attempt to change a mpv setting
+    // in response to an IINA preference change while mpv is shutting down.
+    removeOptionObservers()
+    // Remove observers for mpv properties. Because 0 was passed for reply_userdata when
+    // registering mpv property observers all observers can be removed in one call.
+    mpv_unobserve_property(mpv, 0)
+    // Start mpv quitting. Even though this command is being sent using the synchronous
+    // command API the quit command is special and will be executed by mpv asynchronously.
     command(.quit, level: .verbose)
   }
 
@@ -808,25 +814,17 @@ class MPVController: NSObject {
     mpv_set_property(mpv, name, MPV_FORMAT_DOUBLE, &data)
   }
 
-  func setFlagAsync(_ name: String, _ flag: Bool) {
-    var data: Int = flag ? 1 : 0
-    mpv_set_property_async(mpv, 0, name, MPV_FORMAT_FLAG, &data)
-  }
-
-  func setIntAsync(_ name: String, _ value: Int) {
-    var data = Int64(value)
-    mpv_set_property_async(mpv, 0, name, MPV_FORMAT_INT64, &data)
-  }
-
-  func setDoubleAsync(_ name: String, _ value: Double) {
-    var data = value
-    mpv_set_property_async(mpv, 0, name, MPV_FORMAT_DOUBLE, &data)
-  }
-
   @discardableResult
   func setString(_ name: String, _ value: String, level: Logger.Level = .debug) -> Int32 {
     log("Set property: \(name)=\(value)", level: level)
     return mpv_set_property_string(mpv, name, value)
+  }
+
+  func getEnum<T: MPVOptionValue>(_ name: String) -> T {
+    guard let value = getString(name) else {
+      return T.defaultValue
+    }
+    return T.init(rawValue: value) ?? T.defaultValue
   }
 
   func getInt(_ name: String) -> Int {
@@ -1013,8 +1011,8 @@ class MPVController: NSObject {
   }
 
   func removeHooks(withIdentifier id: String) {
-    $hooks.withLock {
-      $0.filter { (k, v) in v.isJavascript && v.id == id }.keys.forEach { hooks.removeValue(forKey: $0) }
+    $hooks.withLock { hooks in
+      hooks.filter { (k, v) in v.isJavascript && v.id == id }.keys.forEach { hooks.removeValue(forKey: $0) }
     }
   }
 
@@ -1024,18 +1022,23 @@ class MPVController: NSObject {
   private func readEvents() {
     queue.async {
       while ((self.mpv) != nil) {
-        let event = mpv_wait_event(self.mpv, 0)
+        let event = mpv_wait_event(self.mpv, 0)!
+        let eventId = event.pointee.event_id
         // Do not deal with mpv-event-none
-        if event?.pointee.event_id == MPV_EVENT_NONE {
+        if eventId == MPV_EVENT_NONE {
           break
         }
         self.handleEvent(event)
+        // Must stop reading events once the mpv core is shutdown.
+        if eventId == MPV_EVENT_SHUTDOWN {
+          break
+        }
       }
     }
   }
 
   // Handle the event
-  private func handleEvent(_ event: UnsafePointer<mpv_event>!) {
+  private func handleEvent(_ event: UnsafePointer<mpv_event>) {
     let eventId = event.pointee.event_id
 
     switch eventId {
@@ -1121,7 +1124,7 @@ class MPVController: NSObject {
       }
 
     case MPV_EVENT_END_FILE:
-      let reason = event!.pointee.data.load(as: mpv_end_file_reason.self)
+      let reason = event.pointee.data.load(as: mpv_end_file_reason.self)
       DispatchQueue.main.async {
         self.player.fileEnded(dueToStopCommand: reason == MPV_END_FILE_REASON_STOP)
       }
@@ -1279,7 +1282,7 @@ class MPVController: NSObject {
 
     case MPVOption.Audio.mute:
       guard let data = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee else {
-        logPropertyValueError(MPVOption.Video.videoRotate, property.format)
+        logPropertyValueError(MPVOption.Audio.mute, property.format)
         break
       }
       DispatchQueue.main.async { [self] in
@@ -1515,6 +1518,11 @@ class MPVController: NSObject {
 
   private var optionObservers: [String: [OptionObserverInfo]] = [:]
 
+  private func setOptionFlag(_ name: String, _ flag: Bool, level: Logger.Level = .debug) -> Int32 {
+    let value = flag ? yes_str : no_str
+    return setOptionString(name, value, level: level)
+  }
+
   private func setOptionFloat(_ name: String, _ value: Float, level: Logger.Level = .debug) -> Int32 {
     log("Set option: \(name)=\(value)", level: level)
     var data = Double(value)
@@ -1554,8 +1562,7 @@ class MPVController: NSObject {
       code = setOptionFloat(name, Preference.float(for: key), level: level)
 
     case .bool:
-      let value = Preference.bool(for: key)
-      code = setOptionString(name, value ? yes_str : no_str, level: level)
+      code = setOptionFlag(name, Preference.bool(for: key), level: level)
 
     case .string:
       code = setOptionalOptionString(name, Preference.string(for: key), level: level)
@@ -1582,7 +1589,8 @@ class MPVController: NSObject {
     }
 
     if code < 0 {
-      Utility.showAlert("mpv_error", arguments: [String(cString: mpv_error_string(code)), "\(code)", name])
+      Utility.showAlert("mpv_error", arguments: [String(cString: mpv_error_string(code)), "\(code)", name],
+                        disableMenus: true)
     }
 
     if sync {
@@ -1671,7 +1679,7 @@ class MPVController: NSObject {
   /// - Parameter property: Name of the property whose value changed.
   /// - Parameter format: Format of the value contained in the property change event.
   private func logPropertyValueError(_ property: String, _ format: mpv_format) {
-    guard property != MPVProperty.videoParamsRotate, format != MPV_FORMAT_NONE else { return }
+    guard property != MPVProperty.videoParamsRotate || format != MPV_FORMAT_NONE else { return }
     log("""
       Value of property \(property) in the property change event could not be converted from
       \(format) to the expected type
